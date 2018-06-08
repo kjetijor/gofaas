@@ -13,14 +13,12 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/user"
 	"path"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+	"sync/atomic"
 )
 
 type FortuneDB struct {
@@ -201,33 +199,6 @@ func fdbfromdir(dirname string) (*FortuneCollection, error) {
 func logrequest(r *http.Request, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("%s %s %s %s [UA:%s]: %s", r.RemoteAddr, r.Method, r.Host, r.URL.Path, r.Header.Get("User-Agent"), msg)
-}
-
-func dropprivs() {
-
-	u, err := user.Lookup("nobody")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Dropping privileges %s:%s", u.Uid, u.Gid)
-	uid, err := strconv.ParseInt(u.Uid, 10, 64)
-	if err != nil {
-		log.Fatal(err)
-	}
-	gid, err := strconv.ParseInt(u.Gid, 10, 64)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := syscall.Setgroups([]int{}); err != nil {
-		log.Fatalf("Failed to change user groups %v", err)
-	}
-
-	if err := syscall.Setgid(int(gid)); err != nil {
-		log.Fatalf("Failed to change group: %v", err)
-	}
-	if err := syscall.Setuid(int(uid)); err != nil {
-		log.Fatalf("Failed to change user: %v", err)
-	}
 }
 
 func htmlifyfortune(fortune string, r *http.Request, w http.ResponseWriter) {
@@ -466,12 +437,54 @@ type RequestFilter struct {
 	Stats               *sync.Map
 }
 
+func (rf RequestFilter) DoStats(r *http.Request) {
+	path := r.URL.Path
+	replace := regexp.MustCompile("/?[0-9a-fA-F]{32}$")
+	stubbed := replace.ReplaceAllString(path, "")
+	newval := uint64(1)
+	iptr, found := rf.Stats.LoadOrStore(stubbed, &newval)
+	if found {
+		if ptr, ok := iptr.(*uint64); ok {
+			atomic.AddUint64(ptr, 1)
+		} else {
+			log.Printf("BUG: Updating stats, statvalue not *uint64 but %v", iptr)
+		}
+	}
+}
+
+func (rf RequestFilter) HandleStats(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	stats := make(map[string]uint64)
+	rf.Stats.Range(func (key, value interface{}) bool {
+		var skey string
+		var ptr *uint64
+		var ok bool
+		if skey, ok = key.(string); !ok {
+			log.Printf("Non-string stats key %v", key)
+			return false
+		}
+		if ptr, ok = value.(*uint64); !ok {
+			log.Printf("Non-*uint64 stats value %v", value)
+			return false
+		}
+		stats[skey] = *ptr
+		return true
+	})
+	err := json.NewEncoder(w).Encode(stats)
+	if err != nil {
+		http.Error(w,"Faff and wrong", http.StatusInternalServerError)
+	}
+}
+
 func (rf RequestFilter) Filter(h func(w http.ResponseWriter, r *http.Request, ps httprouter.Params)) func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		if rf.AllowHost != nil && !rf.AllowHost.MatchString(r.Host) {
+		stripport := regexp.MustCompile(":\\d+$")
+		reqhost := stripport.ReplaceAllString(r.Host, "")
+		if rf.AllowHost != nil && !rf.AllowHost.MatchString(reqhost) {
+			log.Printf("Denied %s %v", reqhost, rf.AllowHost)
 			http.NotFound(w, r)
 			return
 		}
+		rf.DoStats(r)
 		start := time.Now()
 		h(w, r, ps)
 		if rf.VerboseLoggingUntil != nil && *rf.VerboseLoggingUntil < time.Now().Unix() {
@@ -494,8 +507,13 @@ func main() {
 	static := flag.String("static", "static", "static asset location")
 	loaddir := flag.String("dir", "", "Fortune files to read (directory)")
 	allowhost := flag.String("allowhost", "", "Only allow requests where host matches regexp")
+	failtoroot := flag.Bool("failtoroot", true, "Don't run as root")
 	sr := flag.String("shittyrender", "", "Shitty render directory")
 	flag.Parse()
+	if os.Getuid() == 0 && *failtoroot {
+		log.Printf("Refusing to run as root")
+		return
+	}
 	var fdb *FortuneCollection
 	var err error
 	if len(*loaddir) > 0 {
@@ -526,6 +544,7 @@ func main() {
 	router.GET("/api/v0/fortune", rf.Filter(fdb.GETApiV0Random))
 	router.GET("/api/v0/fortune/:db", rf.Filter(fdb.GETApiV0RandomByDB))
 	router.GET("/api/v0/permalink/:id", rf.Filter(fdb.GETAPIV0PermalinkById))
+	router.GET("/api/v0/stats", rf.Filter(rf.HandleStats))
 	router.GET("/static/:fn", rf.Filter(func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		HandleStaticFile(*static, w, r, ps)
 	}))
@@ -538,9 +557,6 @@ func main() {
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
-	}
-	if os.Geteuid() == 0 || os.Getuid() == 0 {
-		dropprivs()
 	}
 	if ns := os.Getenv("NOTIFY_SOCKET"); len(ns) > 0 {
 		log.Printf("notifying systemd")
