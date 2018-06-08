@@ -14,11 +14,11 @@ import (
 	"net/http"
 	"os"
 	"os/user"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -263,76 +263,238 @@ func NewV0(fortune string) FortuneV0 {
 	}
 }
 
-type FortuneStats struct {
-	SuccessCounts *sync.Map
-	FailCounts    *sync.Map
+type ShittyRender string
+
+func (sr ShittyRender) Add(id string) error {
+	if len(sr) == 0 {
+		return fmt.Errorf("shitty render state tracking not enabled")
+	}
+	accept, err := regexp.Compile("^[a-fA-F0-9]{32}$")
+	if err != nil {
+		log.Printf("BUG: regexp doesn't compile for shittyrenders")
+		return fmt.Errorf("regular expressions are hard!")
+	}
+	if !accept.MatchString(id) {
+		return fmt.Errorf("invalid id")
+	}
+	srfn := path.Join(string(sr), id)
+	if fh, err := os.Create(srfn); err != nil {
+		return err
+	} else {
+		fh.Close()
+		return nil
+	}
 }
 
-func (fs FortuneStats) Register(method, path string) (func(), func()) {
-	failcount := uint64(0)
-	successcount := uint64(0)
-	key := fmt.Sprintf("%s %s", method, path)
-	_, loaded := fs.SuccessCounts.LoadOrStore(key, &successcount)
-	if loaded {
-		log.Panicf("BUG: duplicate success stats for %s %s", method, path)
+func (sr ShittyRender) List() ([]string, error) {
+	finfo, err := ioutil.ReadDir(string(sr))
+	if err != nil {
+		return []string{}, err
 	}
-	_, loaded = fs.FailCounts.LoadOrStore(key, &failcount)
-	if loaded {
-		log.Panicf("BUG: duplicate fail stats for %s %s", method, path)
+	dirs := make([]string, 0)
+	for _, fi := range finfo {
+		dirs = append(dirs, fi.Name())
 	}
-	succ := func() {
-		atomic.AddUint64(&successcount, 1)
-	}
-	fail := func() {
-		atomic.AddUint64(&failcount, 1)
-	}
-	return succ, fail
+	return dirs, nil
 }
 
-type StatsV0 struct {
-	SuccessCounts map[string]uint64 `json:"success"`
-	FailCounts    map[string]uint64 `json:"failures"`
+func (sr ShittyRender) APIV0GETShittyRender(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	bad, err := sr.List()
+	if err != nil {
+		http.Error(w, "fail and wrong", http.StatusInternalServerError)
+		logrequest(r, "Failed to get shitty renders %v", err)
+		return
+	}
+	encoder := json.NewEncoder(w)
+	if err := encoder.Encode(bad); err != nil {
+		http.Error(w, "json encoding is difficult", http.StatusInternalServerError)
+		logrequest(r, "Failed to encode %v as json %v", sr, err)
+	}
 }
 
-func rangeinto(sm *sync.Map, out *map[string]uint64) error {
-	var failed error
-	sm.Range(func(key, value interface{}) bool {
-		k, ok := key.(string)
-		if !ok {
-			log.Printf("failcounts non-string key %v", key)
-			failed = fmt.Errorf("non-string key %v", key)
-			return false
+func (sr ShittyRender) APIV0PUTShittyRender(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	if err := sr.Add(ps.ByName("id")); err != nil {
+		log.Printf("Invalid shitty render request: %v", err)
+		http.Error(w, "badness", http.StatusBadRequest)
+		return
+	}
+	w.Write([]byte("OK\n"))
+}
+
+func (fc *FortuneCollection) GETApiV0DBS(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	dbs := make([]string, 0)
+	for key := range fc.DBs {
+		dbs = append(dbs, key)
+	}
+	encoder := json.NewEncoder(w)
+	if err := encoder.Encode(dbs); err != nil {
+		logrequest(r, "Failed to json encode dbs: %v", err)
+		http.Error(w, "JSON encoding is difficult, soz", http.StatusInternalServerError)
+		return
+	}
+}
+
+func (fc *FortuneCollection) GETApiV0Random(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	fortune, err := fc.Random()
+	if err != nil {
+		http.Error(
+			w,
+			"Bad stuff happened, it's probably logged, and nobody will probably read that",
+			http.StatusInternalServerError)
+		logrequest(r, "fdb.Random() failed %v", err)
+		return
+	} else {
+		rsp := NewV0(fortune)
+		err := rsp.Emit(w)
+		fid := fmt.Sprintf("%x", md5.Sum([]byte(fortune)))
+		if err != nil {
+			http.Error(w, "JSON encoding is really difficult, I'm sorry I failed you", http.StatusInternalServerError)
+			logrequest(r, "Failed to JSON encode fortune %s: %v", fid, err)
+			return
 		}
-		v, ok := value.(*uint64)
-		if !ok {
-			failed = fmt.Errorf("non-*uint64 value %v", value)
-			log.Printf("failcounts non-*uint64 value %v", value)
-			return false
-		}
-		(*out)[k] = *v
-		return true
-	})
-	return failed
+	}
 }
 
-func (fs FortuneStats) JSON(w http.ResponseWriter) error {
-	stats := StatsV0{
-		SuccessCounts: make(map[string]uint64),
-		FailCounts:    make(map[string]uint64),
+// "/api/v0/fortune/:db",
+func (fc *FortuneCollection) GETApiV0RandomByDB(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	db, ok := fc.DBs[ps.ByName("db")]
+	if !ok {
+		http.NotFound(w, r)
+		return
 	}
-	if err := rangeinto(fs.FailCounts, &stats.FailCounts); err != nil {
-		return fmt.Errorf("failed enumerating failcounts: %v", err)
+	fortune, err := db.Random()
+	if err != nil {
+		http.Error(
+			w,
+			"Bad stuff happened, no soup for you",
+			http.StatusInternalServerError)
+		logrequest(r, "Failed to fetch fortune for %s: %v", ps.ByName("db"), err)
+		return
 	}
-	if err := rangeinto(fs.SuccessCounts, &stats.SuccessCounts); err != nil {
-		return fmt.Errorf("failed to enumerate successcounts: %v", err)
+	if err = NewV0(fortune).Emit(w); err != nil {
+		http.Error(w, "Making JSON is hard", http.StatusInternalServerError)
+		logrequest(r, "Failed to emit json: %v", err)
+		return
 	}
-	return json.NewEncoder(w).Encode(stats)
+}
+
+func (fc *FortuneCollection) GETAPIV0PermalinkById(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	fid := ps.ByName("id")
+	fortune, err := fc.GetByPermalink(fid)
+	if err != nil {
+		http.Error(w, "Failed to fetch your fortune", http.StatusInternalServerError)
+		logrequest(r, "Failed to look up fortune %s: %v", fid, err)
+		return
+	}
+	if err := NewV0(fortune).Emit(w); err != nil {
+		logrequest(r, "Failed to emit fortune: %v", err)
+		http.Error(w, "Failed to make your cookie", http.StatusInternalServerError)
+		return
+	}
+}
+
+func (fc *FortuneCollection) GETRandomFortune(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	start := time.Now()
+	fortune, err := fc.Random()
+	html := false
+	if err != nil {
+		http.Error(w, "Bad stuff happened", http.StatusInternalServerError)
+		return
+	} else {
+		accept := strings.Split(r.Header.Get("Accept"), ",")
+		for _, content := range accept {
+			if content == "text/html" {
+				html = true
+				break
+			}
+		}
+		permid := fmt.Sprintf("%x", md5.Sum([]byte(fortune)))
+		w.Header().Add("X-Permalink", fmt.Sprintf("/permalink/%s", permid))
+		if html {
+			htmlifyfortune(fortune, r, w)
+		} else {
+			io.WriteString(w, fortune+"\n")
+		}
+	}
+	logrequest(r, "served random with err=%v html=%v in %v", err, html, time.Now().Sub(start))
+}
+
+func (fc *FortuneCollection) GETRandomByDB(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	html := false
+	db, ok := fc.DBs[ps.ByName("db")]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	fortune, err := db.Random()
+	if err != nil {
+		http.Error(w, "Fail and wrong", http.StatusInternalServerError)
+	} else {
+		accept := strings.Split(r.Header.Get("Accept"), ",")
+		for _, content := range accept {
+			if content == "text/html" {
+				html = true
+				break
+			}
+		}
+		permid := fmt.Sprintf("%x", md5.Sum([]byte(fortune)))
+		w.Header().Add("X-Permalink", fmt.Sprintf("/permalink/%s", permid))
+		if html {
+			htmlifyfortune(fortune, r, w)
+		} else {
+			io.WriteString(w, fortune+"\n")
+		}
+	}
+	logrequest(r, "served random for %s err=%v", ps.ByName("db"), err)
+}
+
+func (fc *FortuneCollection) GETByPermalink(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	start := time.Now()
+	fortune, err := fc.GetByPermalink(ps.ByName("id"))
+	if err != nil {
+		logrequest(r, "Failed to get by permalink %s: %v", ps.ByName("id"), err)
+		http.Error(w, "Bad stuff happened", http.StatusInternalServerError)
+	} else {
+		io.WriteString(w, fortune)
+	}
+	logrequest(r, "served with err=%v in %v", err, time.Now().Sub(start))
+}
+
+type RequestFilter struct {
+	VerboseLoggingUntil *int64
+	AllowHost           *regexp.Regexp
+	Stats               *sync.Map
+}
+
+func (rf RequestFilter) Filter(h func(w http.ResponseWriter, r *http.Request, ps httprouter.Params)) func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		if rf.AllowHost != nil && !rf.AllowHost.MatchString(r.Host) {
+			http.NotFound(w, r)
+			return
+		}
+		start := time.Now()
+		h(w, r, ps)
+		if rf.VerboseLoggingUntil != nil && *rf.VerboseLoggingUntil < time.Now().Unix() {
+			logrequest(r, "completed in %v", time.Now().Sub(start))
+		}
+	}
+}
+
+func HandleStaticFile(root string, w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	fn := ps.ByName("fn")
+	if strings.HasSuffix(fn, ".css") || strings.HasSuffix(fn, ".html") || strings.HasSuffix(fn, ".js") {
+		http.ServeFile(w, r, path.Join(root, fn))
+	} else {
+		http.NotFound(w, r)
+	}
 }
 
 func main() {
 	listen := flag.String("listen", ":8081", "Where to listen to")
 	static := flag.String("static", "static", "static asset location")
 	loaddir := flag.String("dir", "", "Fortune files to read (directory)")
+	allowhost := flag.String("allowhost", "", "Only allow requests where host matches regexp")
+	sr := flag.String("shittyrender", "", "Shitty render directory")
 	flag.Parse()
 	var fdb *FortuneCollection
 	var err error
@@ -345,202 +507,33 @@ func main() {
 		log.Printf("Failed to load fortunefiles from: %v", err)
 		return
 	}
-	fs := FortuneStats{
-		SuccessCounts: &sync.Map{},
-		FailCounts:    &sync.Map{},
+	var rallow *regexp.Regexp = nil
+	if allowhost != nil {
+		rallow, err = regexp.Compile(*allowhost)
+		if err != nil {
+			log.Panicf("Failed to compile filter %s: %v", *allowhost, err)
+		}
 	}
+	rf := RequestFilter{
+		VerboseLoggingUntil: nil,
+		AllowHost:           rallow,
+		Stats:               &sync.Map{},
+	}
+	shittyrender := ShittyRender(*sr)
 	go fdb.Index()
 	router := httprouter.New()
-	s_stats, f_stats := fs.Register("GET", "/api/v0/stats")
-	router.GET("/api/v0/stats", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		if err := fs.JSON(w); err != nil {
-			f_stats()
-			http.Error(w, "Failed to make up some stats", http.StatusInternalServerError)
-			logrequest(r, "Failed to make stats %v", err)
-		} else {
-			s_stats()
-		}
-	})
-	s_api_dbs, f_api_dbs := fs.Register("GET", "/api/v0/dbs")
-	router.GET("/api/v0/dbs", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		dbs := make([]string, 0)
-		for key := range fdb.DBs {
-			dbs = append(dbs, key)
-		}
-		encoder := json.NewEncoder(w)
-		if err := encoder.Encode(dbs); err != nil {
-			f_api_dbs()
-			logrequest(r, "Failed to json encode dbs: %v", err)
-			http.Error(w, "JSON encoding is difficult, soz", http.StatusInternalServerError)
-			return
-		}
-		s_api_dbs()
-	})
-	s_api_rf, f_api_rf := fs.Register("GET", "/api/v0/fortune")
-	router.GET("/api/v0/fortune", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		fortune, err := fdb.Random()
-		if err != nil {
-			http.Error(
-				w,
-				"Bad stuff happened, it's probably logged, and nobody will probably read that",
-				http.StatusInternalServerError)
-			logrequest(r, "fdb.Random() failed %v", err)
-			f_api_rf()
-			return
-		} else {
-			rsp := NewV0(fortune)
-			err := rsp.Emit(w)
-			fid := fmt.Sprintf("%x", md5.Sum([]byte(fortune)))
-			if err != nil {
-				f_api_rf()
-				http.Error(w, "JSON encoding is really difficult, I'm sorry I failed you", http.StatusInternalServerError)
-				logrequest(r, "Failed to JSON encode fortune %s: %v", fid, err)
-				return
-			}
-		}
-		s_api_rf()
-	})
-	s_api_rfdb, f_api_rfdb := fs.Register("GET", "/api/v0/fortune/:db")
-	router.GET("/api/v0/fortune/:db", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		db, ok := fdb.DBs[ps.ByName("db")]
-		if !ok {
-			http.NotFound(w, r)
-			f_api_rfdb()
-			return
-		}
-		fortune, err := db.Random()
-		if err != nil {
-			http.Error(
-				w,
-				"Bad stuff happened, no soup for you",
-				http.StatusInternalServerError)
-			logrequest(r, "Failed to fetch fortune for %s: %v", ps.ByName("db"), err)
-			f_api_rfdb()
-			return
-		}
-		if err = NewV0(fortune).Emit(w); err != nil {
-			http.Error(w, "Making JSON is hard", http.StatusInternalServerError)
-			logrequest(r, "Failed to emit json: %v", err)
-			f_api_rfdb()
-			return
-		}
-		s_api_rfdb()
-	})
-	s_api_perm, f_api_perm := fs.Register("GET", "/api/v0/permalink/:id")
-	router.GET("/api/v0/permalink/:id", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		fid := ps.ByName("id")
-		fortune, err := fdb.GetByPermalink(fid)
-		if err != nil {
-			http.Error(w, "Failed to fetch your fortune", http.StatusInternalServerError)
-			logrequest(r, "Failed to look up fortune %s: %v", fid, err)
-			f_api_perm()
-			return
-		}
-		if err := NewV0(fortune).Emit(w); err != nil {
-			logrequest(r, "Failed to emit fortune: %v", err)
-			http.Error(w, "Failed to make your cookie", http.StatusInternalServerError)
-			f_api_perm()
-			return
-		}
-		s_api_perm()
-	})
-	router.GET("/static/:fn", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		fn := ps.ByName("fn")
-		if strings.HasSuffix(fn, ".css") || strings.HasSuffix(fn, ".html") || strings.HasSuffix(fn, ".js") {
-			http.ServeFile(w, r, fmt.Sprintf("%s/%s", *static, fn))
-		} else {
-			http.NotFound(w, r)
-		}
-	})
-	s_get_root, f_get_root := fs.Register("GET", "/")
-	router.GET("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		start := time.Now()
-		fortune, err := fdb.Random()
-		html := false
-		if err != nil {
-			http.Error(w, "Bad stuff happened", http.StatusInternalServerError)
-			f_get_root()
-			return
-		} else {
-			accept := strings.Split(r.Header.Get("Accept"), ",")
-			for _, content := range accept {
-				if content == "text/html" {
-					html = true
-					break
-				}
-			}
-			permid := fmt.Sprintf("%x", md5.Sum([]byte(fortune)))
-			w.Header().Add("X-Permalink", fmt.Sprintf("/permalink/%s", permid))
-			if html {
-				htmlifyfortune(fortune, r, w)
-			} else {
-				io.WriteString(w, fortune+"\n")
-			}
-		}
-		if err != nil {
-			f_get_root()
-		} else {
-			s_get_root()
-		}
-		logrequest(r, "served random with err=%v html=%v in %v", err, html, time.Now().Sub(start))
-	})
-	s_get_db, f_get_db := fs.Register("GET", "/db/:db")
-	router.GET("/db/:db", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		html := false
-		db, ok := fdb.DBs[ps.ByName("db")]
-		if !ok {
-			http.NotFound(w, r)
-			f_get_db()
-			return
-		}
-		fortune, err := db.Random()
-		if err != nil {
-			http.Error(w, "Fail and wrong", http.StatusInternalServerError)
-		} else {
-			accept := strings.Split(r.Header.Get("Accept"), ",")
-			for _, content := range accept {
-				if content == "text/html" {
-					html = true
-					break
-				}
-			}
-			permid := fmt.Sprintf("%x", md5.Sum([]byte(fortune)))
-			w.Header().Add("X-Permalink", fmt.Sprintf("/permalink/%s", permid))
-			if html {
-				htmlifyfortune(fortune, r, w)
-			} else {
-				io.WriteString(w, fortune+"\n")
-			}
-		}
-		if err == nil {
-			s_get_db()
-		} else {
-			f_get_db()
-		}
-		logrequest(r, "served random for %s err=%v", ps.ByName("db"), err)
-	})
-	s_get_dbs, _ := fs.Register("GET", "/db")
-	router.GET("/db", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		for k := range fdb.DBs {
-			w.Write([]byte(k))
-			w.Write([]byte("\n"))
-		}
-		s_get_dbs()
-	})
-	s_get_permalink, f_get_permalink := fs.Register("GET", "/permalink/:id")
-	router.GET("/permalink/:id", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		start := time.Now()
-		fortune, err := fdb.GetByPermalink(ps.ByName("id"))
-		if err != nil {
-			logrequest(r, "Failed to get by permalink %s: %v", ps.ByName("id"), err)
-			http.Error(w, "Bad stuff happened", http.StatusInternalServerError)
-			f_get_permalink()
-		} else {
-			io.WriteString(w, fortune)
-			s_get_permalink()
-		}
-		logrequest(r, "served with err=%v in %v", err, time.Now().Sub(start))
-	})
+	router.GET("/api/v0/dbs", rf.Filter(fdb.GETApiV0DBS))
+	router.GET("/api/v0/fortune", rf.Filter(fdb.GETApiV0Random))
+	router.GET("/api/v0/fortune/:db", rf.Filter(fdb.GETApiV0RandomByDB))
+	router.GET("/api/v0/permalink/:id", rf.Filter(fdb.GETAPIV0PermalinkById))
+	router.GET("/static/:fn", rf.Filter(func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		HandleStaticFile(*static, w, r, ps)
+	}))
+	router.GET("/", rf.Filter(fdb.GETRandomFortune))
+	router.GET("/db/:db", rf.Filter(fdb.GETRandomByDB))
+	router.GET("/permalink/:id", rf.Filter(fdb.GETByPermalink))
+	router.GET("/api/v0/shittyrender", rf.Filter(shittyrender.APIV0GETShittyRender))
+	router.PUT("/api/v0/shittyrender/:id", rf.Filter(shittyrender.APIV0PUTShittyRender))
 	srv := &http.Server{Addr: *listen, Handler: router}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
