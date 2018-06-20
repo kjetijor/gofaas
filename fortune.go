@@ -46,7 +46,6 @@ type PermaLink struct {
 type FortuneCollection struct {
 	DBs     map[string]*FortuneDB
 	Links   *PermaLink
-	Weights []DBThreshold
 }
 
 func (fdb *FortuneDB) Get(n uint64) (string, error) {
@@ -480,7 +479,7 @@ func (rf RequestFilter) Filter(h func(w http.ResponseWriter, r *http.Request, ps
 		stripport := regexp.MustCompile(":\\d+$")
 		reqhost := stripport.ReplaceAllString(r.Host, "")
 		if rf.AllowHost != nil && !rf.AllowHost.MatchString(reqhost) {
-			log.Printf("Denied %s %v", reqhost, rf.AllowHost)
+			logrequest(r, "404 unknown host \"%s\" UA:\"%s\"", reqhost, r.Header.Get("User-Agent"))
 			http.NotFound(w, r)
 			return
 		}
