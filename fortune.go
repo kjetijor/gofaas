@@ -28,11 +28,6 @@ type FortuneDB struct {
 	FortuneStarts []uint64
 }
 
-type DBThreshold struct {
-	Threshold float64
-	Key       string
-}
-
 type Locator struct {
 	Name string
 	Id   uint64
@@ -83,7 +78,7 @@ func (fc *FortuneCollection) Index() {
 	start := time.Now()
 	log.Println("Indexing..")
 	index := make(map[string]Locator)
-	keys := []string{}
+	keys := make([]string, 0)
 	for name, fdb := range fc.DBs {
 		for i := 0; i < len(fdb.FortuneStarts); i++ {
 			fortune, err := fdb.Get(uint64(i))
@@ -179,7 +174,7 @@ func fdbfromdir(dirname string) (*FortuneCollection, error) {
 		return nil, err
 	}
 	if len(finfo) == 0 {
-		return nil, fmt.Errorf("No files found")
+		return nil, fmt.Errorf("no files found")
 	}
 	fdb := &FortuneCollection{
 		DBs: make(map[string]*FortuneDB),
@@ -200,7 +195,7 @@ func logrequest(r *http.Request, format string, args ...interface{}) {
 	log.Printf("%s %s %s %s [UA:%s]: %s", r.RemoteAddr, r.Method, r.Host, r.URL.Path, r.Header.Get("User-Agent"), msg)
 }
 
-func htmlifyfortune(fortune string, r *http.Request, w http.ResponseWriter) {
+func htmlifyfortune(fortune string, _ *http.Request, w http.ResponseWriter) {
 	out := `<html>
 	<head>
 		<title>Fortunes!</title>
@@ -242,7 +237,7 @@ func (sr ShittyRender) Add(id string) error {
 	accept, err := regexp.Compile("^[a-fA-F0-9]{32}$")
 	if err != nil {
 		log.Printf("BUG: regexp doesn't compile for shittyrenders")
-		return fmt.Errorf("regular expressions are hard!")
+		return fmt.Errorf("regular expressions are hard")
 	}
 	if !accept.MatchString(id) {
 		return fmt.Errorf("invalid id")
@@ -432,14 +427,14 @@ func (fc *FortuneCollection) GETByPermalink(w http.ResponseWriter, r *http.Reque
 
 type RequestFilter struct {
 	VerboseLoggingUntil *int64
-	AllowHost           *regexp.Regexp
+	VHost               *string
 	Stats               *sync.Map
 }
 
 func (rf RequestFilter) DoStats(r *http.Request) {
-	path := r.URL.Path
+	urlpath := r.URL.Path
 	replace := regexp.MustCompile("/?[0-9a-fA-F]{32}$")
-	stubbed := replace.ReplaceAllString(path, "")
+	stubbed := replace.ReplaceAllString(urlpath, "")
 	newval := uint64(1)
 	iptr, found := rf.Stats.LoadOrStore(stubbed, &newval)
 	if found {
@@ -477,10 +472,16 @@ func (rf RequestFilter) HandleStats(w http.ResponseWriter, r *http.Request, ps h
 func (rf RequestFilter) Filter(h func(w http.ResponseWriter, r *http.Request, ps httprouter.Params)) func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		stripport := regexp.MustCompile(":\\d+$")
-		reqhost := stripport.ReplaceAllString(r.Host, "")
-		if rf.AllowHost != nil && !rf.AllowHost.MatchString(reqhost) {
-			logrequest(r, "404 unknown host \"%s\" UA:\"%s\"", reqhost, r.Header.Get("User-Agent"))
-			http.NotFound(w, r)
+		stripdot := regexp.MustCompile("\\.$")
+		reqhost := stripdot.ReplaceAllString(stripport.ReplaceAllString(r.Host, ""), "")
+		if r.ProtoMajor != 1 && r.ProtoMajor != 1 {
+			logrequest(r, "Bad protocol UA %s", r.Header.Get("User-Agent"))
+			http.Error(w, "Try http 1.1", http.StatusForbidden)
+			return
+		}
+		if rf.VHost != nil && *rf.VHost != reqhost {
+			logrequest(r, "Redirecting to %s", *rf.VHost)
+			http.Redirect(w, r, fmt.Sprintf("http://%s/", *rf.VHost), http.StatusPermanentRedirect)
 			return
 		}
 		rf.DoStats(r)
@@ -505,7 +506,7 @@ func main() {
 	listen := flag.String("listen", ":8081", "Where to listen to")
 	static := flag.String("static", "static", "static asset location")
 	loaddir := flag.String("dir", "", "Fortune files to read (directory)")
-	allowhost := flag.String("allowhost", "", "Only allow requests where host matches regexp")
+	vhost := flag.String("vhost", "", "Only allow requests for host")
 	failtoroot := flag.Bool("failtoroot", true, "Don't run as root")
 	sr := flag.String("shittyrender", "", "Shitty render directory")
 	flag.Parse()
@@ -524,16 +525,9 @@ func main() {
 		log.Printf("Failed to load fortunefiles from: %v", err)
 		return
 	}
-	var rallow *regexp.Regexp = nil
-	if allowhost != nil {
-		rallow, err = regexp.Compile(*allowhost)
-		if err != nil {
-			log.Panicf("Failed to compile filter %s: %v", *allowhost, err)
-		}
-	}
 	rf := RequestFilter{
 		VerboseLoggingUntil: nil,
-		AllowHost:           rallow,
+		VHost:               vhost,
 		Stats:               &sync.Map{},
 	}
 	shittyrender := ShittyRender(*sr)
