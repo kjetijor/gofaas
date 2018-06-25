@@ -192,7 +192,19 @@ func fdbfromdir(dirname string) (*FortuneCollection, error) {
 
 func logrequest(r *http.Request, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	log.Printf("%s %s %s %s [UA:%s]: %s", r.RemoteAddr, r.Method, r.Host, r.URL.Path, r.Header.Get("User-Agent"), msg)
+	printaddr := r.RemoteAddr
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	rhost := r.Host
+	if err == nil {
+		remaddr := net.ParseIP(host)
+		if xff := r.Header.Get("X-Forwarded-For"); remaddr.IsLoopback() && len(xff) > 0 {
+			printaddr = "[XFF] " + xff
+			r.Host = ""
+		}
+	} else {
+		log.Printf("Failed to parse host/port of %s %v", r.RemoteAddr, err)
+	}
+	log.Printf("%s %s %s %s [UA:%s]: %s", printaddr, r.Method, rhost, r.URL.Path, r.Header.Get("User-Agent"), msg)
 }
 
 func htmlifyfortune(fortune string, _ *http.Request, w http.ResponseWriter) {
@@ -516,6 +528,9 @@ func main() {
 	}
 	var fdb *FortuneCollection
 	var err error
+	if vhost != nil && len(*vhost) == 0 {
+		vhost = nil
+	}
 	if len(*loaddir) > 0 {
 		fdb, err = fdbfromdir(*loaddir)
 	} else {
